@@ -2,12 +2,18 @@ import AVFoundation
 import Combine
 import Speech
 
-// Helper: keeps AVAudioPlayerDelegate off the main actor
 private final class AudioPlayerHelper: NSObject, AVAudioPlayerDelegate {
     var onFinish: () -> Void = {}
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully _: Bool) {
         onFinish()
     }
+}
+
+struct ChatMessage: Identifiable {
+    let id = UUID()
+    let role: Role
+    let text: String
+    enum Role { case user, assistant }
 }
 
 @MainActor
@@ -17,9 +23,10 @@ final class VoiceManager: NSObject, ObservableObject {
 
     @Published var appState: AppState = .idle
     @Published var liveTranscript = ""
-    @Published var lastResponse = ""
+    @Published var messages: [ChatMessage] = []
     @Published var errorMessage: String?
     @Published var isConnected = false
+    @Published var queueCount = 0
 
     let sessionId = UUID().uuidString
 
@@ -29,6 +36,10 @@ final class VoiceManager: NSObject, ObservableObject {
     private let audioEngine = AVAudioEngine()
     private var audioPlayer: AVAudioPlayer?
     private let playerHelper = AudioPlayerHelper()
+
+    private var requestQueue: [String] = []
+    private var isApiProcessing = false
+    private var audioPlayContinuation: CheckedContinuation<Void, Never>?
 
     // MARK: - Permissions
 
@@ -53,7 +64,9 @@ final class VoiceManager: NSObject, ObservableObject {
     // MARK: - Listening
 
     func startListening() {
-        guard appState == .idle else { return }
+        if appState == .speaking { interruptAudio() }
+        guard appState == .idle || appState == .processing else { return }
+
         liveTranscript = ""
 
         do {
@@ -79,9 +92,11 @@ final class VoiceManager: NSObject, ObservableObject {
                     }
                     if let error {
                         let code = (error as NSError).code
-                        if code != 301 && code != 203 { // 301=cancelled, 203=no speech
+                        if code != 301 && code != 203 {
                             self.stopEngine()
-                            if self.appState == .listening { self.appState = .idle }
+                            if self.appState == .listening {
+                                self.appState = self.isApiProcessing ? .processing : .idle
+                            }
                         }
                     }
                 }
@@ -107,12 +122,26 @@ final class VoiceManager: NSObject, ObservableObject {
         finishAndSend()
     }
 
+    private func interruptAudio() {
+        guard let cont = audioPlayContinuation else { return }
+        audioPlayContinuation = nil
+        playerHelper.onFinish = {}
+        audioPlayer?.stop()
+        cont.resume()
+    }
+
     private func finishAndSend() {
         stopEngine()
         let text = liveTranscript.trimmingCharacters(in: .whitespaces)
-        guard !text.isEmpty else { appState = .idle; return }
+        guard !text.isEmpty else {
+            appState = isApiProcessing ? .processing : .idle
+            return
+        }
+        messages.append(ChatMessage(role: .user, text: text))
+        requestQueue.append(text)
+        queueCount = requestQueue.count
         appState = .processing
-        Task { await sendText(text) }
+        if !isApiProcessing { processQueue() }
     }
 
     private func stopEngine() {
@@ -124,22 +153,37 @@ final class VoiceManager: NSObject, ObservableObject {
         recognitionTask = nil
     }
 
+    // MARK: - Queue
+
+    private func processQueue() {
+        guard !requestQueue.isEmpty else {
+            isApiProcessing = false
+            if appState != .listening { appState = .idle }
+            return
+        }
+        isApiProcessing = true
+        let text = requestQueue.removeFirst()
+        queueCount = requestQueue.count
+        Task { await sendText(text) }
+    }
+
     // MARK: - API + Playback
 
     private func sendText(_ text: String) async {
         do {
             let response = try await JarvisAPI.shared.chat(text: text, sessionId: sessionId)
-            lastResponse = response.text
+            messages.append(ChatMessage(role: .assistant, text: response.text))
             if let audioData = Data(base64Encoded: response.audio_base64) {
                 await playAudio(data: audioData)
             }
         } catch {
             errorMessage = "오류: \(error.localizedDescription)"
         }
-        appState = .idle
+        processQueue()
     }
 
     private func playAudio(data: Data) async {
+        guard appState != .listening else { return }
         appState = .speaking
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .default)
@@ -148,20 +192,32 @@ final class VoiceManager: NSObject, ObservableObject {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             do {
                 audioPlayer = try AVAudioPlayer(data: data)
-                playerHelper.onFinish = { cont.resume() }
+                playerHelper.onFinish = { [weak self] in
+                    self?.audioPlayContinuation = nil
+                    cont.resume()
+                }
+                audioPlayContinuation = cont
                 audioPlayer?.delegate = playerHelper
                 audioPlayer?.play()
             } catch {
+                audioPlayContinuation = nil
                 cont.resume()
             }
+        }
+
+        if appState == .speaking {
+            appState = isApiProcessing ? .processing : .idle
         }
     }
 
     // MARK: - Session
 
     func clearSession() {
-        lastResponse = ""
+        messages = []
         liveTranscript = ""
+        requestQueue = []
+        queueCount = 0
+        isApiProcessing = false
         Task { try? await JarvisAPI.shared.clearSession(sessionId: sessionId) }
     }
 }

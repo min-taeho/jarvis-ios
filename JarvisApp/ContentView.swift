@@ -54,11 +54,21 @@ struct ContentView: View {
                 }
             }
             Spacer()
+            if voice.queueCount > 0 {
+                Text("대기 \(voice.queueCount)")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.orange.opacity(0.15))
+                    .cornerRadius(8)
+            }
             Button(action: { showClearConfirm = true }) {
                 Image(systemName: "trash")
                     .foregroundColor(.gray)
                     .font(.system(size: 15))
             }
+            .padding(.leading, 12)
         }
         .padding(.horizontal, 24)
         .padding(.top, 16)
@@ -71,24 +81,29 @@ struct ContentView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(spacing: 16) {
-                    if voice.lastResponse.isEmpty && voice.liveTranscript.isEmpty {
+                    if voice.messages.isEmpty && voice.liveTranscript.isEmpty {
                         placeholderView
                     }
-                    if !voice.lastResponse.isEmpty {
-                        ResponseBubble(text: voice.lastResponse).id("response")
+                    ForEach(voice.messages) { msg in
+                        if msg.role == .user {
+                            TranscriptBubble(text: msg.text)
+                        } else {
+                            ResponseBubble(text: msg.text)
+                        }
                     }
                     if !voice.liveTranscript.isEmpty {
-                        TranscriptBubble(text: voice.liveTranscript).id("transcript")
+                        TranscriptBubble(text: voice.liveTranscript).id("live")
                     }
+                    Color.clear.frame(height: 1).id("bottom")
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 16)
             }
-            .onChange(of: voice.liveTranscript) { _ in
-                withAnimation { proxy.scrollTo("transcript", anchor: .bottom) }
+            .onChange(of: voice.messages.count) { _ in
+                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
             }
-            .onChange(of: voice.lastResponse) { _ in
-                withAnimation { proxy.scrollTo("response", anchor: .bottom) }
+            .onChange(of: voice.liveTranscript) { _ in
+                withAnimation { proxy.scrollTo("live", anchor: .bottom) }
             }
         }
     }
@@ -117,7 +132,6 @@ struct ContentView: View {
                 .animation(.easeInOut, value: voice.appState)
 
             ZStack {
-                // Pulse ring (listening only)
                 if voice.appState == .listening {
                     Circle()
                         .strokeBorder(Color.red.opacity(0.3), lineWidth: 1)
@@ -139,7 +153,7 @@ struct ContentView: View {
                             .foregroundColor(buttonColor)
                     }
                 }
-                .disabled(!hasPermission || voice.appState == .processing || voice.appState == .speaking)
+                .disabled(!hasPermission)
             }
         }
         .padding(.bottom, 52)
@@ -150,9 +164,10 @@ struct ContentView: View {
 
     private func handleTap() {
         switch voice.appState {
-        case .idle: voice.startListening()
-        case .listening: voice.stopListening()
-        default: break
+        case .idle:       voice.startListening()
+        case .listening:  voice.stopListening()
+        case .processing: voice.startListening()
+        case .speaking:   voice.startListening()
         }
     }
 
@@ -160,10 +175,14 @@ struct ContentView: View {
 
     private var statusText: String {
         switch voice.appState {
-        case .idle:       return hasPermission ? "탭하여 말하기" : "마이크 권한이 필요합니다"
-        case .listening:  return "듣는 중 — 다시 탭하면 전송"
-        case .processing: return "처리 중..."
-        case .speaking:   return "응답 중..."
+        case .idle:
+            return hasPermission ? "탭하여 말하기" : "마이크 권한이 필요합니다"
+        case .listening:
+            return "듣는 중 — 다시 탭하면 전송"
+        case .processing:
+            return voice.queueCount > 0 ? "처리 중... (대기 \(voice.queueCount)개)" : "처리 중..."
+        case .speaking:
+            return voice.queueCount > 0 ? "응답 중... (대기 \(voice.queueCount)개)" : "응답 중... (탭하면 중단)"
         }
     }
 
@@ -189,8 +208,8 @@ struct ContentView: View {
         switch voice.appState {
         case .idle:       return "mic"
         case .listening:  return "stop.fill"
-        case .processing: return "ellipsis"
-        case .speaking:   return "speaker.wave.2"
+        case .processing: return "mic"
+        case .speaking:   return "mic"
         }
     }
 }
